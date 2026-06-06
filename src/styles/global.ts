@@ -10,6 +10,7 @@ export const colors = {
   success: '#10B981',
   danger: '#EF4444',
   border: '#E5E7EB',
+  textMuted: '#9CA3AF',
 };
 
 export const globalStyles = StyleSheet.create({

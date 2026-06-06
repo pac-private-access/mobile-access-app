@@ -1,8 +1,11 @@
 import { colors } from '@/styles/global';
 import { Ionicons } from '@expo/vector-icons';
 import { Tabs } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context'; // ← adaugă
 
 export default function TabLayout() {
+  const insets = useSafeAreaInsets(); // ← adaugă
+
   return (
     <Tabs
       screenOptions={{
@@ -10,8 +13,8 @@ export default function TabLayout() {
         tabBarStyle: {
           backgroundColor: colors.surface,
           borderTopColor: colors.border,
-          height: 68,
-          paddingBottom: 10,
+          height: 60 + insets.bottom,   // ← se adaptează automat
+          paddingBottom: insets.bottom,  // ← spațiu pentru gesture bar
           paddingTop: 6,
         },
         tabBarActiveTintColor: colors.primary,
