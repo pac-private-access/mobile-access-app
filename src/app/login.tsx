@@ -22,33 +22,10 @@ const DEVICE_ID_KEY = 'PRIVATE_DEVICE_ID';
 const AUTH_TOKEN    = 'AUTH_TOKEN';
 const USER_ID_KEY   = 'LOGGED_USER_ID';
 
-// async function getOrCreateDeviceId(): Promise<string> {
-//   const existing = await SecureStore.getItemAsync(DEVICE_ID_KEY);
-//   if (existing) return existing;
-
-//   let nativeId = 'unknown';
-//   try {
-//     if (Platform.OS === 'android') {
-//       nativeId = Application.getAndroidId() ?? 'android-unknown';
-//     } else if (Platform.OS === 'ios') {
-//       nativeId = (await Application.getIosIdForVendorAsync()) ?? 'ios-unknown';
-//     }
-//   } catch {}
-
-//   const raw = await Crypto.digestStringAsync(
-//     Crypto.CryptoDigestAlgorithm.SHA256,
-//     `${nativeId}_${Date.now()}_${Math.random()}`
-//   );
-//   const deviceId = raw.slice(0, 32).toUpperCase();
-//   await SecureStore.setItemAsync(DEVICE_ID_KEY, deviceId);
-//   return deviceId;
-// }
 async function getOrCreateDeviceId(): Promise<string> {
-  // Verifică mai întâi SecureStore
   const existing = await SecureStore.getItemAsync(DEVICE_ID_KEY);
   if (existing) return existing;
 
-  // Generează din hardware ID — fără random, fără timestamp
   let nativeId = 'unknown';
   try {
     if (Platform.OS === 'android') {
@@ -58,51 +35,174 @@ async function getOrCreateDeviceId(): Promise<string> {
     }
   } catch {}
 
-  // SHA-256 doar din hardware ID — același rezultat la reinstalare
   const raw = await Crypto.digestStringAsync(
     Crypto.CryptoDigestAlgorithm.SHA256,
-    nativeId  // ← fără Date.now() și fără Math.random()
+    nativeId
   );
   const deviceId = raw.slice(0, 32).toUpperCase();
   await SecureStore.setItemAsync(DEVICE_ID_KEY, deviceId);
   return deviceId;
 }
 
-type DeviceStatus = 'approved' | 'pending_approval' | 'rejected';
-
 export default function LoginScreen() {
-  const [email, setEmail]                       = useState('');
-  const [password, setPassword]                 = useState('');
-  const [showPassword, setShowPassword]         = useState(false);
-  const [loading, setLoading]                   = useState(false);
-  const [pendingApproval, setPendingApproval]   = useState(false);
-  const [pendingUserName, setPendingUserName]   = useState('');
+  const [email, setEmail]                           = useState('');
+  const [password, setPassword]                     = useState('');
+  const [showPassword, setShowPassword]             = useState(false);
+  const [loading, setLoading]                       = useState(false);
 
-  const handleLogin = async () => {
-  setLoading(true);
-  try {
-    // 1. Verifică credențialele în employees
-    const { data: emp, error } = await supabase
-      .from('employees')
-      .select('id, first_name, last_name, is_active, is_access_active, password_hash')
-      .eq('email', email.trim().toLowerCase())
-      .single();
+  // Pas 1 — email verificat, afișează câmpul parolă
+  const [emailChecked, setEmailChecked]             = useState(false);
 
-    if (error || !emp) { Alert.alert('Eroare', 'Email sau parolă incorectă.'); return; }
-    if (!emp.is_active) { Alert.alert('Cont dezactivat', 'Contactați administratorul.'); return; }
+  // Ecran așteptare aprobare
+  const [pendingApproval, setPendingApproval]       = useState(false);
+  const [pendingUserName, setPendingUserName]       = useState('');
 
-    const inputHash = await Crypto.digestStringAsync(
-      Crypto.CryptoDigestAlgorithm.SHA256, password
-    );
-    if (emp.password_hash !== inputHash) {
-      Alert.alert('Eroare', 'Email sau parolă incorectă.');
+  // Ecran setare parolă
+  const [needsPasswordSetup, setNeedsPasswordSetup] = useState(false);
+  const [cnpInput, setCnpInput]                     = useState('');
+  const [newPassword, setNewPassword]               = useState('');
+  const [confirmPassword, setConfirmPassword]       = useState('');
+  const [showNewPassword, setShowNewPassword]       = useState(false);
+  const [pendingEmployeeId, setPendingEmployeeId]   = useState('');
+  const [pendingCnp, setPendingCnp]                 = useState('');
+
+  // ─── Pas 1 — verifică email ───────────────────────────────────────────────
+  const handleCheckEmail = async () => {
+    if (!email.trim()) {
+      Alert.alert('Eroare', 'Introduceți email-ul.');
       return;
     }
 
-    // 2. Generează / recuperează device ID (merge în puk_code)
+    setLoading(true);
+    try {
+      const { data: emp, error } = await supabase
+        .from('employees')
+        .select('id, first_name, last_name, is_active, password_hash, cnp')
+        .eq('email', email.trim().toLowerCase())
+        .single();
+
+      if (error || !emp) {
+        Alert.alert('Eroare', 'Email-ul nu a fost găsit.');
+        return;
+      }
+
+      if (!emp.is_active) {
+        Alert.alert('Cont dezactivat', 'Contactați administratorul.');
+        return;
+      }
+
+      // Prima logare — nu are parolă → direct la activare cont
+      if (!emp.password_hash) {
+        setPendingEmployeeId(emp.id);
+        setPendingUserName(`${emp.first_name} ${emp.last_name}`);
+        setPendingCnp(emp.cnp);
+        setNeedsPasswordSetup(true);
+        return;
+      }
+
+      // Are parolă → afișează câmpul parolă
+      setEmailChecked(true);
+
+    } catch (e: any) {
+      Alert.alert('Eroare', 'A apărut o problemă. Verificați conexiunea.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ─── Pas 2 — verifică parola ──────────────────────────────────────────────
+  const handleLogin = async () => {
+    if (!password.trim()) {
+      Alert.alert('Eroare', 'Introduceți parola.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { data: emp, error } = await supabase
+        .from('employees')
+        .select('id, first_name, last_name, is_access_active, password_hash')
+        .eq('email', email.trim().toLowerCase())
+        .single();
+
+      if (error || !emp) {
+        Alert.alert('Eroare', 'A apărut o problemă.');
+        return;
+      }
+
+      const inputHash = await Crypto.digestStringAsync(
+        Crypto.CryptoDigestAlgorithm.SHA256,
+        password
+      );
+
+      if (emp.password_hash !== inputHash) {
+        Alert.alert('Eroare', 'Parolă incorectă.');
+        return;
+      }
+
+      await handleDeviceRegistration(emp.id, `${emp.first_name} ${emp.last_name}`);
+
+    } catch (e: any) {
+      Alert.alert('Eroare', 'A apărut o problemă. Verificați conexiunea.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ─── Setare parolă cu verificare CNP ─────────────────────────────────────
+  const handleSetPassword = async () => {
+    if (!cnpInput.trim()) {
+      Alert.alert('Eroare', 'Introduceți CNP-ul.');
+      return;
+    }
+    if (cnpInput.trim() !== pendingCnp) {
+      Alert.alert('Eroare', 'CNP incorect.');
+      return;
+    }
+    if (newPassword.length < 6) {
+      Alert.alert('Eroare', 'Parola trebuie să aibă minim 6 caractere.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      Alert.alert('Eroare', 'Parolele nu coincid.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const hashedPassword = await Crypto.digestStringAsync(
+        Crypto.CryptoDigestAlgorithm.SHA256,
+        newPassword
+      );
+
+      const { error } = await supabase
+        .from('employees')
+        .update({ password_hash: hashedPassword })
+        .eq('id', pendingEmployeeId);
+
+      if (error) {
+        Alert.alert('Eroare', 'Nu s-a putut seta parola: ' + error.message);
+        return;
+      }
+
+      setNeedsPasswordSetup(false);
+      setCnpInput('');
+      setNewPassword('');
+      setConfirmPassword('');
+
+      await handleDeviceRegistration(pendingEmployeeId, pendingUserName);
+
+    } catch (e: any) {
+      Alert.alert('Eroare', e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ─── Înregistrare dispozitiv ──────────────────────────────────────────────
+  const handleDeviceRegistration = async (employeeId: string, userName: string) => {
     const deviceId = await getOrCreateDeviceId();
 
-    // 3. Caută smartphone după puk_code = deviceId
     const { data: phone } = await supabase
       .from('smartphones')
       .select('id, is_active, employee_id')
@@ -110,31 +210,27 @@ export default function LoginScreen() {
       .single();
 
     if (phone) {
-      // Device înregistrat deja
-      if (phone.employee_id !== emp.id) {
+      if (phone.employee_id !== employeeId) {
         Alert.alert('Eroare', 'Dispozitivul este asociat altui angajat.');
         return;
       }
       if (!phone.is_active) {
-        // Salvează userId pentru polling
-        await SecureStore.setItemAsync(USER_ID_KEY, emp.id);
-        setPendingUserName(`${emp.first_name} ${emp.last_name}`);
+        await SecureStore.setItemAsync(USER_ID_KEY, employeeId);
+        setPendingUserName(userName);
         setPendingApproval(true);
         return;
       }
-      // Activ — intră în app
-      await SecureStore.setItemAsync(AUTH_TOKEN, `token-${emp.id}`);
-      await SecureStore.setItemAsync(USER_ID_KEY, emp.id);
+      await SecureStore.setItemAsync(AUTH_TOKEN, `token-${employeeId}`);
+      await SecureStore.setItemAsync(USER_ID_KEY, employeeId);
       router.replace('/(tabs)' as any);
       return;
     }
 
-    // 4. Primul login — INSERT cu puk_code = deviceId
     const { error: insertErr } = await supabase
       .from('smartphones')
       .insert({
-        employee_id:   emp.id,
-        puk_code:      deviceId,  // ← device ID direct în puk_code
+        employee_id:   employeeId,
+        puk_code:      deviceId,
         is_active:     false,
         registered_at: new Date().toISOString(),
       });
@@ -144,58 +240,166 @@ export default function LoginScreen() {
       return;
     }
 
-    await SecureStore.setItemAsync(USER_ID_KEY, emp.id);
-    setPendingUserName(`${emp.first_name} ${emp.last_name}`);
+    await SecureStore.setItemAsync(USER_ID_KEY, employeeId);
+    setPendingUserName(userName);
     setPendingApproval(true);
+  };
 
-  } catch (e: any) {
-    Alert.alert('Eroare', 'A apărut o problemă. Verificați conexiunea.');
-  } finally {
-    setLoading(false);
-  }
-};
-
-
+  // ─── Verificare aprobare ──────────────────────────────────────────────────
   const handleCheckApproval = async () => {
-  setLoading(true);
-  try {
-    const deviceId = await SecureStore.getItemAsync(DEVICE_ID_KEY);
-    console.log('[Check] Device ID din SecureStore:', deviceId);
+    setLoading(true);
+    try {
+      const deviceId = await SecureStore.getItemAsync(DEVICE_ID_KEY);
+      if (!deviceId) {
+        Alert.alert('Eroare', 'Device ID negăsit.');
+        return;
+      }
 
-    if (!deviceId) {
-      Alert.alert('Eroare', 'Device ID negăsit.');
-      return;
+      const { data: phone, error } = await supabase
+        .from('smartphones')
+        .select('is_active, puk_code, employee_id')
+        .eq('puk_code', deviceId)
+        .single();
+
+      if (error) {
+        Alert.alert('Eroare DB', error.message);
+        return;
+      }
+
+      if (phone?.is_active) {
+        const userId = await SecureStore.getItemAsync(USER_ID_KEY);
+        await SecureStore.setItemAsync(AUTH_TOKEN, `token-${userId}`);
+        router.replace('/(tabs)' as any);
+      } else {
+        Alert.alert('În așteptare', 'Cererea nu a fost aprobată încă.');
+      }
+    } catch (e: any) {
+      Alert.alert('Eroare', e.message);
+    } finally {
+      setLoading(false);
     }
+  };
 
-    const { data: phone, error } = await supabase
-      .from('smartphones')
-      .select('is_active, puk_code, employee_id')
-      .eq('puk_code', deviceId)
-      .single();
+  // ─── Ecran setare parolă ──────────────────────────────────────────────────
+  if (needsPasswordSetup) {
+    return (
+      <KeyboardAvoidingView
+        style={styles.container}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
+        <View style={styles.logoSection}>
+          <View style={[styles.logoBox, { backgroundColor: '#10B981' }]}>
+            <Ionicons name="key" size={36} color="#fff" />
+          </View>
+          <Text style={styles.appName}>Activare cont</Text>
+          <Text style={styles.appSubtitle}>Bun venit, {pendingUserName}!</Text>
+        </View>
 
-    console.log('[Check] Phone din DB:', phone);
-    console.log('[Check] Error:', error);
+        <View style={styles.form}>
+          <View style={styles.infoBox}>
+            <Ionicons name="information-circle-outline" size={16} color={colors.primary} />
+            <Text style={styles.infoText}>
+              Introduceți CNP-ul pentru verificarea identității și setați o parolă personală.
+            </Text>
+          </View>
 
-    if (error) {
-      Alert.alert('Eroare DB', error.message);
-      return;
-    }
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>CNP</Text>
+            <View style={styles.inputRow}>
+              <Ionicons name="card-outline" size={18}
+                color={colors.textSecondary} style={styles.inputIcon} />
+              <TextInput
+                style={styles.input}
+                placeholder="Introduceți CNP-ul"
+                placeholderTextColor={colors.textSecondary}
+                value={cnpInput}
+                onChangeText={setCnpInput}
+                keyboardType="numeric"
+                maxLength={13}
+                editable={!loading}
+                autoFocus
+              />
+            </View>
+          </View>
 
-    if (phone?.is_active) {
-      const userId = await SecureStore.getItemAsync(USER_ID_KEY);
-      await SecureStore.setItemAsync(AUTH_TOKEN, `token-${userId}`);
-      router.replace('/(tabs)' as any);
-    } else {
-      Alert.alert('În așteptare', `is_active = ${phone?.is_active}`);
-    }
-  } catch (e: any) {
-    Alert.alert('Eroare', e.message);
-  } finally {
-    setLoading(false);
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>Parolă nouă</Text>
+            <View style={styles.inputRow}>
+              <Ionicons name="lock-closed-outline" size={18}
+                color={colors.textSecondary} style={styles.inputIcon} />
+              <TextInput
+                style={[styles.input, { flex: 1 }]}
+                placeholder="Minim 6 caractere"
+                placeholderTextColor={colors.textSecondary}
+                value={newPassword}
+                onChangeText={setNewPassword}
+                secureTextEntry={!showNewPassword}
+                editable={!loading}
+              />
+              <TouchableOpacity
+                onPress={() => setShowNewPassword(!showNewPassword)}
+                style={styles.eyeBtn}
+              >
+                <Ionicons
+                  name={showNewPassword ? 'eye-off-outline' : 'eye-outline'}
+                  size={20} color={colors.textSecondary}
+                />
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>Confirmă parola</Text>
+            <View style={styles.inputRow}>
+              <Ionicons name="lock-closed-outline" size={18}
+                color={colors.textSecondary} style={styles.inputIcon} />
+              <TextInput
+                style={[styles.input, { flex: 1 }]}
+                placeholder="Repetă parola"
+                placeholderTextColor={colors.textSecondary}
+                value={confirmPassword}
+                onChangeText={setConfirmPassword}
+                secureTextEntry={!showNewPassword}
+                editable={!loading}
+              />
+            </View>
+          </View>
+
+          <TouchableOpacity
+            style={[
+              styles.loginBtn,
+              { backgroundColor: '#10B981' },
+              loading && styles.loginBtnDisabled
+            ]}
+            onPress={handleSetPassword}
+            disabled={loading}
+            activeOpacity={0.85}
+          >
+            {loading
+              ? <ActivityIndicator size="small" color="#fff" />
+              : <Ionicons name="checkmark-circle-outline" size={20} color="#fff" />}
+            <Text style={styles.loginBtnText}>
+              {loading ? 'Se activează...' : 'Activează contul'}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.backBtn}
+            onPress={() => {
+              setNeedsPasswordSetup(false);
+              setCnpInput('');
+              setNewPassword('');
+              setConfirmPassword('');
+            }}
+          >
+            <Text style={styles.backBtnText}>Înapoi la autentificare</Text>
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
+    );
   }
-};
 
-  // ─── Ecran așteptare ─────────────────────────────────────────────────────
+  // ─── Ecran așteptare aprobare ─────────────────────────────────────────────
   if (pendingApproval) {
     return (
       <View style={styles.pendingContainer}>
@@ -214,13 +418,22 @@ export default function LoginScreen() {
               {Platform.OS === 'android' ? 'Android' : 'iOS'} · ID dispozitiv înregistrat
             </Text>
           </View>
-          <TouchableOpacity style={styles.checkBtn} onPress={handleCheckApproval} disabled={loading}>
+          <TouchableOpacity
+            style={styles.checkBtn}
+            onPress={handleCheckApproval}
+            disabled={loading}
+          >
             {loading
               ? <ActivityIndicator size="small" color="#fff" />
               : <Ionicons name="refresh" size={18} color="#fff" />}
-            <Text style={styles.checkBtnText}>{loading ? 'Se verifică...' : 'Verifică statusul'}</Text>
+            <Text style={styles.checkBtnText}>
+              {loading ? 'Se verifică...' : 'Verifică statusul'}
+            </Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.backBtn} onPress={() => setPendingApproval(false)}>
+          <TouchableOpacity
+            style={styles.backBtn}
+            onPress={() => setPendingApproval(false)}
+          >
             <Text style={styles.backBtnText}>Înapoi la autentificare</Text>
           </TouchableOpacity>
         </View>
@@ -228,9 +441,12 @@ export default function LoginScreen() {
     );
   }
 
-  // ─── Ecran login ──────────────────────────────────────────────────────────
+  // ─── Ecran login principal ────────────────────────────────────────────────
   return (
-    <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
       <View style={styles.logoSection}>
         <View style={styles.logoBox}>
           <Ionicons name="lock-closed" size={36} color="#fff" />
@@ -240,53 +456,98 @@ export default function LoginScreen() {
       </View>
 
       <View style={styles.form}>
+
+        {/* ─── Email ───────────────────────────────────────────────────── */}
         <View style={styles.fieldGroup}>
           <Text style={styles.label}>Email</Text>
           <View style={styles.inputRow}>
-            <Ionicons name="mail-outline" size={18} color={colors.textSecondary} style={styles.inputIcon} />
+            <Ionicons name="mail-outline" size={18}
+              color={colors.textSecondary} style={styles.inputIcon} />
             <TextInput
               style={styles.input}
               placeholder="angajat@companie.ro"
               placeholderTextColor={colors.textSecondary}
               value={email}
-              onChangeText={setEmail}
+              onChangeText={(text) => {
+                setEmail(text);
+                // Resetează pasul 2 dacă schimbă email-ul
+                if (emailChecked) {
+                  setEmailChecked(false);
+                  setPassword('');
+                }
+              }}
               keyboardType="email-address"
               autoCapitalize="none"
               autoCorrect={false}
               editable={!loading}
             />
+            {/* Buton schimbare email după verificare */}
+            {emailChecked && (
+              <TouchableOpacity
+                onPress={() => {
+                  setEmailChecked(false);
+                  setPassword('');
+                }}
+                style={styles.eyeBtn}
+              >
+                <Ionicons name="close-circle-outline" size={20}
+                  color={colors.textSecondary} />
+              </TouchableOpacity>
+            )}
           </View>
         </View>
 
-        <View style={styles.fieldGroup}>
-          <Text style={styles.label}>Parolă</Text>
-          <View style={styles.inputRow}>
-            <Ionicons name="key-outline" size={18} color={colors.textSecondary} style={styles.inputIcon} />
-            <TextInput
-              style={[styles.input, { flex: 1 }]}
-              placeholder="Introduceți parola"
-              placeholderTextColor={colors.textSecondary}
-              value={password}
-              onChangeText={setPassword}
-              secureTextEntry={!showPassword}
-              editable={!loading}
-            />
-            <TouchableOpacity onPress={() => setShowPassword(!showPassword)} style={styles.eyeBtn}>
-              <Ionicons name={showPassword ? 'eye-off-outline' : 'eye-outline'} size={20} color={colors.textSecondary} />
-            </TouchableOpacity>
+        {/* ─── Parolă — vizibil doar după verificare email ─────────────── */}
+        {emailChecked && (
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>Parolă</Text>
+            <View style={styles.inputRow}>
+              <Ionicons name="key-outline" size={18}
+                color={colors.textSecondary} style={styles.inputIcon} />
+              <TextInput
+                style={[styles.input, { flex: 1 }]}
+                placeholder="Introduceți parola"
+                placeholderTextColor={colors.textSecondary}
+                value={password}
+                onChangeText={setPassword}
+                secureTextEntry={!showPassword}
+                editable={!loading}
+                autoFocus
+              />
+              <TouchableOpacity
+                onPress={() => setShowPassword(!showPassword)}
+                style={styles.eyeBtn}
+              >
+                <Ionicons
+                  name={showPassword ? 'eye-off-outline' : 'eye-outline'}
+                  size={20} color={colors.textSecondary}
+                />
+              </TouchableOpacity>
+            </View>
           </View>
-        </View>
+        )}
 
+        {/* ─── Buton principal ─────────────────────────────────────────── */}
         <TouchableOpacity
-          style={[styles.loginBtn, loading && styles.loginBtnDisabled]}
-          onPress={handleLogin}
-          disabled={loading}
+          style={[
+            styles.loginBtn,
+            (loading || !email.trim() || (emailChecked && !password.trim())) && styles.loginBtnDisabled
+          ]}
+          onPress={emailChecked ? handleLogin : handleCheckEmail}
+          disabled={loading || !email.trim() || (emailChecked && !password.trim())}
           activeOpacity={0.85}
         >
           {loading
             ? <ActivityIndicator size="small" color="#fff" />
-            : <Ionicons name="log-in-outline" size={20} color="#fff" />}
-          <Text style={styles.loginBtnText}>{loading ? 'Se conectează...' : 'Autentificare'}</Text>
+            : <Ionicons
+                name={emailChecked ? 'log-in-outline' : 'arrow-forward-outline'}
+                size={20} color="#fff"
+              />}
+          <Text style={styles.loginBtnText}>
+            {loading
+              ? 'Se conectează...'
+              : emailChecked ? 'Autentificare' : 'Continuare'}
+          </Text>
         </TouchableOpacity>
 
         <View style={styles.deviceNote}>
@@ -311,7 +572,7 @@ const styles = StyleSheet.create({
     shadowColor: colors.primary, shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.35, shadowRadius: 16, elevation: 10,
   },
   appName: { fontSize: 22, fontWeight: '700', color: colors.text, letterSpacing: -0.3 },
-  appSubtitle: { fontSize: 13, color: colors.textSecondary, marginTop: 4 },
+  appSubtitle: { fontSize: 13, color: colors.textSecondary, marginTop: 4, textAlign: 'center' },
   form: { gap: 4 },
   fieldGroup: { marginBottom: 16 },
   label: { fontSize: 13, fontWeight: '600', color: colors.textSecondary, marginBottom: 8, marginLeft: 2 },
@@ -364,4 +625,10 @@ const styles = StyleSheet.create({
   checkBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
   backBtn: { marginTop: 4, padding: 8 },
   backBtnText: { color: colors.textSecondary, fontSize: 14 },
+  infoBox: {
+    flexDirection: 'row', gap: 8, alignItems: 'flex-start',
+    marginBottom: 20, padding: 12, backgroundColor: colors.surface,
+    borderRadius: 10, borderWidth: 1, borderColor: colors.border,
+  },
+  infoText: { flex: 1, fontSize: 12, color: colors.textSecondary, lineHeight: 18 },
 });

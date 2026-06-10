@@ -3,9 +3,12 @@ import { BleManager } from 'react-native-ble-plx';
 
 // ─── UUID-uri din ESP32 (ArduinoBLE) ─────────────────────────────────────────
 const ESP32_DEVICE_NAME  = 'ESP32_BLE';
-const ESP32_SERVICE_UUID = '0000180a-0000-1000-8000-00805f9b34fb'; // 180A expanded
-const ESP32_RX_CHAR_UUID = '00002a19-0000-1000-8000-00805f9b34fb'; // 2A19 — telefonul scrie
-const ESP32_TX_CHAR_UUID = '00002a1a-0000-1000-8000-00805f9b34fb'; // 2A1A — telefonul citește
+const ESP32_SERVICE_UUID = '0000180a-0000-1000-8000-00805f9b34fb';
+const ESP32_RX_CHAR_UUID = '00002a19-0000-1000-8000-00805f9b34fb';
+const ESP32_TX_CHAR_UUID = '00002a1a-0000-1000-8000-00805f9b34fb';
+
+// ─── IP-ul PC-ului portarului pe rețeaua locală ───────────────────────────────
+const BACKEND_URL = 'http://192.168.1.100:8080';
 
 const manager = new BleManager();
 let connectedDevice: any | null = null;
@@ -97,13 +100,13 @@ export async function transmitSecurityCode(
   try {
     console.log('[BLE] Scanare după ESP32_BLE...');
 
-    // 1. Scanare după nume
+    // 1. Scanare după ESP32 — 3 secunde
     const device = await new Promise<any | null>((resolve) => {
       let found: any | null = null;
       const timeout = setTimeout(() => {
         manager.stopDeviceScan();
         resolve(found);
-      }, 10000);
+      }, 3000); // ← redus la 3s ca să nu aștepte prea mult
 
       manager.startDeviceScan(
         null,
@@ -129,29 +132,24 @@ export async function transmitSecurityCode(
       );
     });
 
+    // 2. ESP32 negăsit → flux pietoni via WiFi
     if (!device) {
-      return {
-        success: false,
-        error: 'ESP32_BLE nu a fost găsit. Apropiați-vă de poartă și verificați că ESP32-ul e pornit.',
-      };
+      console.log('[WiFi] ESP32 negăsit — trimit via WiFi la portar');
+      return await sendViaWifi(bluetoothSecurityCode);
     }
 
     console.log(`[BLE] Găsit: ${device.name} (${device.id})`);
 
-    // 2. Conectare
+    // 3. Conectare ESP32
     connectedDevice = await device.connect({
       timeout: 15000,
       requestMTU: 256,
     });
 
-    // 3. Delay după conectare — ESP32 are nevoie de timp
     await new Promise((res) => setTimeout(res, 800));
-
-    // 4. Discover servicii
     await connectedDevice.discoverAllServicesAndCharacteristics();
     console.log('[BLE] Servicii descoperite');
 
-    // 5. Verifică că service-ul există
     const services = await connectedDevice.services();
     console.log('[BLE] Servicii disponibile:', services.map((s: { uuid: string }) => s.uuid));
 
@@ -167,8 +165,6 @@ export async function transmitSecurityCode(
       };
     }
 
-    // 6. Trimite codul pe RX characteristic (2A19)
-    // ArduinoBLE primește string direct — nu e nevoie de base64
     const encoded = btoa(bluetoothSecurityCode);
     await connectedDevice.writeCharacteristicWithResponseForService(
       ESP32_SERVICE_UUID,
@@ -178,7 +174,6 @@ export async function transmitSecurityCode(
 
     console.log(`[BLE] Cod transmis pe RX: ${bluetoothSecurityCode}`);
 
-    // 7. Citește răspunsul de pe TX characteristic (2A1A) — opțional
     try {
       const response = await connectedDevice.readCharacteristicForService(
         ESP32_SERVICE_UUID,
@@ -189,7 +184,6 @@ export async function transmitSecurityCode(
         console.log('[BLE] Răspuns ESP32:', decoded);
       }
     } catch {
-      // Răspunsul e opțional
     }
 
     await disconnectDevice();
@@ -199,6 +193,56 @@ export async function transmitSecurityCode(
     console.error('[BLE] Eroare:', e.message);
     await disconnectDevice();
     return { success: false, error: e.message ?? 'Eroare la transmisie BLE.' };
+  }
+}
+
+// ─── FLUX PIETONI — WiFi → Spring Boot ─────────────────────────────
+async function sendViaWifi(
+  bluetoothSecurityCode: string
+): Promise<BleTransmitResult> {
+  try {
+    console.log(`[WiFi] Trimit la ${BACKEND_URL}/api/gate/authorize`);
+
+    const controller = new AbortController();
+    const timeout    = setTimeout(() => controller.abort(), 5000);
+
+    const res = await fetch(`${BACKEND_URL}/api/gate/authorize`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        bluetoothSecurityCode,
+        direction:    'ENTRY',
+        accessMethod: 'bluetooth_pc',
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      return { success: false, error: `Server error: ${res.status}` };
+    }
+
+    const data = await res.json();
+    console.log('[WiFi] Răspuns backend:', data);
+
+    if (data.status === 'GRANTED') {
+      return { success: true, deviceName: 'PC Portar' };
+    }
+
+    return { success: false, error: data.message ?? 'Acces refuzat.' };
+
+  } catch (e: any) {
+    if (e.name === 'AbortError') {
+      return {
+        success: false,
+        error:   'Timeout — portarul nu răspunde.\nVerificați conexiunea WiFi.',
+      };
+    }
+    return {
+      success: false,
+      error:   'Nu s-a putut contacta portarul.\nVerificați că sunteți pe același WiFi.',
+    };
   }
 }
 
