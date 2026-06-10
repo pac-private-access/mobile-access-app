@@ -8,7 +8,7 @@ const ESP32_RX_CHAR_UUID = '00002a19-0000-1000-8000-00805f9b34fb';
 const ESP32_TX_CHAR_UUID = '00002a1a-0000-1000-8000-00805f9b34fb';
 
 // ─── IP-ul PC-ului portarului pe rețeaua locală ───────────────────────────────
-const BACKEND_URL = 'http://192.168.1.100:8080';
+const BACKEND_URL = 'https://pac-management.onrender.com';
 
 const manager = new BleManager();
 let connectedDevice: any | null = null;
@@ -201,47 +201,32 @@ async function sendViaWifi(
   bluetoothSecurityCode: string
 ): Promise<BleTransmitResult> {
   try {
-    console.log(`[WiFi] Trimit la ${BACKEND_URL}/api/gate/authorize`);
+    console.log('[WiFi] ESP32 negăsit — verificare angajat în baza de date...');
 
-    const controller = new AbortController();
-    const timeout    = setTimeout(() => controller.abort(), 5000);
+    const { supabase } = await import('./supabase');
 
-    const res = await fetch(`${BACKEND_URL}/api/gate/authorize`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        bluetoothSecurityCode,
-        direction:    'ENTRY',
-        accessMethod: 'bluetooth_pc',
-      }),
-      signal: controller.signal,
-    });
+    const { data: emp, error: empErr } = await supabase
+      .from('employees')
+      .select('id, is_access_active')
+      .eq('bluetooth_security_code', bluetoothSecurityCode)
+      .single();
 
-    clearTimeout(timeout);
-
-    if (!res.ok) {
-      return { success: false, error: `Server error: ${res.status}` };
+    if (empErr || !emp) {
+      return { success: false, error: 'Angajat negăsit.' };
     }
 
-    const data = await res.json();
-    console.log('[WiFi] Răspuns backend:', data);
-
-    if (data.status === 'GRANTED') {
-      return { success: true, deviceName: 'PC Portar' };
+    if (!emp.is_access_active) {
+      return { success: false, error: 'Acces dezactivat.' };
     }
 
-    return { success: false, error: data.message ?? 'Acces refuzat.' };
+    // NU inserează aici — inserarea o face index.tsx prin enqueueAccessEvent + flushAccessQueue
+    console.log('[WiFi] Angajat verificat ✓');
+    return { success: true, deviceName: 'PC Portar' };
 
   } catch (e: any) {
-    if (e.name === 'AbortError') {
-      return {
-        success: false,
-        error:   'Timeout — portarul nu răspunde.\nVerificați conexiunea WiFi.',
-      };
-    }
     return {
       success: false,
-      error:   'Nu s-a putut contacta portarul.\nVerificați că sunteți pe același WiFi.',
+      error: 'Nu s-a putut verifica angajatul.\nVerificați conexiunea.',
     };
   }
 }

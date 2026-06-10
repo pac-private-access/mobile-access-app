@@ -4,9 +4,6 @@ import { supabase } from './supabase';
 
 const DEVICE_ID_KEY = 'PRIVATE_DEVICE_ID';
 
-// ─── IP-ul PC-ului portarului ─────────────────────────────────────────────────
-const BACKEND_URL = 'http://192.168.1.100:8080'; // ← emulator Android
-
 export type ProfileResult = {
   employeeId:     string;
   numeComplet:    string;
@@ -49,37 +46,113 @@ const CACHE = {
   queue:   'OFFLINE_QUEUE_V2',
 };
 
-// ─── Helper fetch cu timeout ──────────────────────────────────────────────────
-async function fetchBackend(path: string): Promise<any> {
-  const controller = new AbortController();
-  const timeout    = setTimeout(() => controller.abort(), 8000);
+const BACKEND_URL = 'https://pac-management.onrender.com';
 
-  try {
-    const res = await fetch(`${BACKEND_URL}${path}`, {
-      method:  'GET',
-      headers: { 'Content-Type': 'application/json' },
-      signal:  controller.signal,
-    });
+// ─── Helper orar ──────────────────────────────────────────────────────────────
+const DAY_NAMES: Record<number, string> = {
+  0: 'Dum', 1: 'Lun', 2: 'Mar',
+  3: 'Mie', 4: 'Joi', 5: 'Vin', 6: 'Sâm',
+};
 
-    if (!res.ok) throw new Error(`Server error: ${res.status}`);
-    return await res.json();
+function buildOrarString(schedules: any[]): string {
+  if (!schedules || schedules.length === 0) return 'Nespecificat';
 
-  } catch (e: any) {
-    if (e.name === 'AbortError') {
-      throw new Error('Timeout — calculatorul de la poartă nu răspunde.');
-    }
-    throw e;
-  } finally {
-    clearTimeout(timeout);
+  const groups: Record<string, string[]> = {};
+  for (const s of schedules) {
+    const from = s.time_from?.slice(0, 5) ?? '?';
+    const to   = s.time_to?.slice(0, 5)   ?? '?';
+    const key  = `${from}-${to}`;
+    const day  = s.day_of_week !== null && s.day_of_week !== undefined
+      ? DAY_NAMES[s.day_of_week] ?? `Z${s.day_of_week}`
+      : 'Zilnic';
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(day);
   }
+
+  return Object.entries(groups)
+    .map(([interval, days]) => `${days.join(', ')} ${interval}`)
+    .join(' | ');
 }
 
-// ─── getProfile — via Spring Boot ────────────────────────────────────────────
+// ─── fetchBackend
+async function fetchBackend(path: string, employeeId?: string): Promise<any> {
+
+  // /api/mobile/profile/:id
+  if (path.includes('/api/mobile/profile/')) {
+    const id = path.split('/').pop();
+
+    const { data: emp, error } = await supabase
+      .from('employees')
+      .select(`
+        *,
+        divisions(name),
+        schedules(
+          day_of_week,
+          time_from,
+          time_to,
+          valid_from,
+          valid_to
+        )
+      `)
+      .eq('id', id)
+      .single();
+
+    if (error || !emp) throw new Error('Angajat negăsit.');
+
+    const validTo = emp.schedules?.find((s: any) => s.valid_to)?.valid_to ?? null;
+
+    return {
+      employeeId:     emp.id,
+      numeComplet:    `${emp.first_name} ${emp.last_name}`,
+      badgeNumber:    emp.badge_number,
+      cnp:            emp.cnp,
+      divisie:        emp.divisions?.name ?? 'Necunoscut',
+      orarPermis:     buildOrarString(emp.schedules ?? []),
+      acordatDeBadge: emp.access_granted_by_badge ?? null,
+      valabilPana:    validTo,
+      isAccessActive: emp.is_access_active,
+      carPlate:       emp.car_plate ?? null,
+      bluetoothCode:  emp.bluetooth_security_code,
+      photoUrl:       emp.photo_url ?? null,
+    };
+  }
+
+  // /api/mobile/report/:id
+  if (path.includes('/api/mobile/report/')) {
+    const id = path.split('/').pop();
+
+    const startOfMonth = new Date();
+    startOfMonth.setDate(1);
+    startOfMonth.setHours(0, 0, 0, 0);
+
+    const { data, error } = await supabase
+      .from('access_logs')
+      .select('*')
+      .eq('employee_id', id)
+      .gte('event_at', startOfMonth.toISOString())
+      .order('event_at', { ascending: false });
+
+    if (error) throw new Error(error.message);
+
+    return (data ?? []).map((log: any) => ({
+      id:            log.id,
+      eventType:     log.event_type === 'entry' ? 'Intrare' : 'Iesire',
+      accessMethod:  log.access_method,
+      isAuthorized:  log.is_authorized,
+      outOfSchedule: log.out_of_schedule,
+      eventAt:       log.event_at,
+      synced:        log.synced_to_cloud,
+    }));
+  }
+
+  throw new Error(`Path necunoscut: ${path}`);
+}
+
+// ─── getProfile ───────────────────────────────────────────────────────────────
 export async function getProfile(): Promise<ProfileResult> {
   const deviceId = await SecureStore.getItemAsync(DEVICE_ID_KEY);
   if (!deviceId) throw new Error('Device ID negăsit. Reconectați-vă.');
 
-  // Verificare smartphone — rămâne în Supabase (autentificare locală)
   const { data: phone, error: phoneErr } = await supabase
     .from('smartphones')
     .select('employee_id, is_active')
@@ -89,7 +162,6 @@ export async function getProfile(): Promise<ProfileResult> {
   if (phoneErr || !phone) throw new Error('Dispozitiv neînregistrat.');
   if (!phone.is_active) throw new Error('Dispozitiv neaprobat. Contactați administratorul.');
 
-  // Datele angajatului vin din Spring Boot
   const data = await fetchBackend(`/api/mobile/profile/${phone.employee_id}`);
 
   const profile: ProfileResult = {
@@ -117,12 +189,11 @@ export async function getCachedProfile(): Promise<ProfileResult | null> {
   return raw ? JSON.parse(raw) : null;
 }
 
-// ─── getRaport — via Spring Boot ─────────────────────────────────────────────
+// ─── getRaport ────────────────────────────────────────────────────────────────
 export async function getRaport(): Promise<RaportEntry[]> {
   const cached = await getCachedProfile();
   if (!cached?.employeeId) throw new Error('Profil negăsit. Reîncărcați aplicația.');
 
-  // Raportul vine din Spring Boot
   const data = await fetchBackend(`/api/mobile/report/${cached.employeeId}`);
 
   const entries: RaportEntry[] = (data ?? []).map((log: any) => ({
@@ -173,7 +244,6 @@ export async function flushQueue(): Promise<number> {
     return 0;
   }
 
-  // flushQueue trimite la Spring Boot
   const rows = validQueue.map((ev) => ({
     employee_id:     ev.employeeId,
     event_type:      ev.eventType === 'Intrare' ? 'entry' : 'exit',
